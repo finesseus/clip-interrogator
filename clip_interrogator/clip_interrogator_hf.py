@@ -9,7 +9,8 @@ import torch
 
 from dataclasses import dataclass
 from PIL import Image
-from transformers import AutoProcessor, AutoModelForCausalLM, BlipForConditionalGeneration, Blip2ForConditionalGeneration
+from transformers import AutoProcessor, AutoModelForCausalLM, BlipForConditionalGeneration, \
+    Blip2ForConditionalGeneration, CLIPModel, CLIPProcessor, CLIPTokenizer, AutoTokenizer
 from tqdm import tqdm
 from typing import List, Optional
 
@@ -41,6 +42,7 @@ class Config:
 
     # clip settings
     clip_model_name: str = 'ViT-L-14/openai'
+    clip_model_name_hf: str = ''
     clip_model_path: Optional[str] = None
     clip_offload: bool = False
 
@@ -96,6 +98,9 @@ class Interrogator():
         start_time = time.time()
         config = self.config
 
+        self.clip_model_hf = CLIPModel.from_pretrained(config.clip_model_name_hf)
+        self.clip_preprocess_hf = CLIPProcessor.from_pretrained(config.clip_model_name_hf)
+        self.tokenize_hf = AutoTokenizer.from_pretrained(config.clip_model_name_hf)
         clip_model_name, clip_model_pretrained_name = config.clip_model_name.split('/', 2)
 
         if config.clip_model is None:
@@ -179,7 +184,7 @@ class Interrogator():
             flave = best[len(curr_prompt)+2:]
             if not check(flave, idx):
                 break
-            if _prompt_at_max_len(curr_prompt, self.tokenize):
+            if _prompt_at_max_len(curr_prompt, self.tokenize_hf):
                 break
             phrases.remove(flave)
 
@@ -202,6 +207,34 @@ class Interrogator():
             image_features /= image_features.norm(dim=-1, keepdim=True)
         return image_features
 
+    def text_to_features(self, texts: List[str]) -> torch.Tensor:
+        self._prepare_clip()
+        text_tokens = self.tokenize(texts).to(self.device)
+        with torch.no_grad(), torch.cuda.amp.autocast():
+            text_features = self.clip_model.encode_text(text_tokens)
+            text_features /= text_features.norm(dim=-1, keepdim=True)
+        return text_features
+
+    def image_to_features_hf(self, image: Image) -> torch.Tensor:
+        self._prepare_clip()
+        inputs = self.clip_preprocess_hf(images=image, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        with torch.no_grad(), torch.cuda.amp.autocast():
+            image_features = self.clip_model_hf.get_image_features(**inputs)
+            image_features = image_features / image_features.norm(p=2, dim=-1, keepdim=True)
+        return image_features
+
+    def text_to_features_hf(self, texts: List[str]) -> torch.Tensor:
+        self._prepare_clip()
+        inputs = self.tokenize_hf(texts, padding=True, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        with torch.no_grad(), torch.cuda.amp.autocast():
+            text_features = self.clip_model_hf.get_text_features(**inputs)
+            text_features = text_features / text_features.norm(p=2, dim=-1, keepdim=True)
+        return text_features
+
+
+
     def interrogate_classic(self, image: Image, max_flavors: int=3, caption: Optional[str]=None) -> str:
         """Classic mode creates a prompt in a standard format first describing the image,
         then listing the artist, trending, movement, and flavor text modifiers."""
@@ -219,6 +252,7 @@ class Interrogator():
         else:
             prompt = f"{caption}, {medium} {artist}, {trending}, {movement}, {flaves}"
 
+        # TODO: update tokenize
         return _truncate_to_fit(prompt, self.tokenize)
 
     def interrogate_fast(self, image: Image, max_flavors: int=32, caption: Optional[str]=None) -> str:
@@ -229,6 +263,7 @@ class Interrogator():
         image_features = self.image_to_features(image)
         merged = _merge_tables([self.artists, self.flavors, self.mediums, self.movements, self.trendings], self)
         tops = merged.rank(image_features, max_flavors)
+        # TODO: update tokenize
         return _truncate_to_fit(caption + ", " + ", ".join(tops), self.tokenize)
 
     def interrogate_negative(self, image: Image, max_flavors: int = 32) -> str:
@@ -239,6 +274,21 @@ class Interrogator():
         flaves = self.flavors.rank(image_features, self.config.flavor_intermediate_count, reverse=True)
         flaves = flaves + self.negative.labels
         return self.chain(image_features, flaves, max_count=max_flavors, reverse=True, desc="Negative chain")
+
+    def interrogate_hf(self, image: Image, labels: 'LabelTable', min_flavors: int = 8, max_flavors: int = 32,
+                        caption: Optional[str] = None) -> str:
+
+        # caption = caption or self.generate_caption(image)
+        image_features = self.image_to_features_hf(image)
+        flaves = labels.rank(image_features, self.config.flavor_intermediate_count)
+        best_prompt, best_sim = caption, self.similarity(image_features, caption)
+        best_prompt = self.chain(image_features, flaves, best_prompt, best_sim, min_count=min_flavors, max_count=max_flavors, desc="Flavor chain")
+
+        # fast_prompt = self.interrogate_fast(image, max_flavors, caption=caption)
+        # classic_prompt = self.interrogate_classic(image, max_flavors, caption=caption)
+        # candidates = [caption, classic_prompt, fast_prompt, best_prompt]
+        candidates = [caption, best_prompt]
+        return candidates[np.argmax(self.similarities(image_features, candidates))]
 
     def interrogate(self, image: Image, min_flavors: int=8, max_flavors: int=32, caption: Optional[str]=None) -> str:
         caption = caption or self.generate_caption(image)
@@ -256,10 +306,8 @@ class Interrogator():
 
     def rank_top(self, image_features: torch.Tensor, text_array: List[str], reverse: bool=False) -> str:
         self._prepare_clip()
-        text_tokens = self.tokenize([text for text in text_array]).to(self.device)
+        text_features = self.text_to_features_hf(text_array)
         with torch.no_grad(), torch.cuda.amp.autocast():
-            text_features = self.clip_model.encode_text(text_tokens)
-            text_features /= text_features.norm(dim=-1, keepdim=True)
             similarity = text_features @ image_features.T
             if reverse:
                 similarity = -similarity
@@ -267,19 +315,15 @@ class Interrogator():
 
     def similarity(self, image_features: torch.Tensor, text: str) -> float:
         self._prepare_clip()
-        text_tokens = self.tokenize([text]).to(self.device)
+        text_features = self.text_to_features_hf(text)
         with torch.no_grad(), torch.cuda.amp.autocast():
-            text_features = self.clip_model.encode_text(text_tokens)
-            text_features /= text_features.norm(dim=-1, keepdim=True)
             similarity = text_features @ image_features.T
         return similarity[0][0].item()
 
     def similarities(self, image_features: torch.Tensor, text_array: List[str]) -> List[float]:
         self._prepare_clip()
-        text_tokens = self.tokenize([text for text in text_array]).to(self.device)
+        text_features = self.text_to_features_hf(text_array)
         with torch.no_grad(), torch.cuda.amp.autocast():
-            text_features = self.clip_model.encode_text(text_tokens)
-            text_features /= text_features.norm(dim=-1, keepdim=True)
             similarity = text_features @ image_features.T
         return similarity.T[0].tolist()
 
@@ -297,6 +341,7 @@ class Interrogator():
             self.caption_offloaded = True
         if self.clip_offloaded:
             self.clip_model = self.clip_model.to(self.device)
+            self.clip_model_hf = self.clip_model_hf.to(self.device)
             self.clip_offloaded = False
 
 
@@ -318,10 +363,8 @@ class LabelTable():
             self.embeds = []
             chunks = np.array_split(self.labels, max(1, len(self.labels)/config.chunk_size))
             for chunk in tqdm(chunks, desc=f"Preprocessing {desc}" if desc else None, disable=self.config.quiet):
-                text_tokens = self.tokenize(chunk).to(self.device)
+                text_features = ci.text_to_features_hf(list(chunk))
                 with torch.no_grad(), torch.cuda.amp.autocast():
-                    text_features = clip_model.encode_text(text_tokens)
-                    text_features /= text_features.norm(dim=-1, keepdim=True)
                     text_features = text_features.half().cpu().numpy()
                 for i in range(text_features.shape[0]):
                     self.embeds.append(text_features[i])
@@ -422,9 +465,10 @@ def _merge_tables(tables: List[LabelTable], ci: Interrogator) -> LabelTable:
         m.embeds.extend(table.embeds)
     return m
 
-def _prompt_at_max_len(text: str, tokenize) -> bool:
-    tokens = tokenize([text])
-    return tokens[0][-1] != 0
+def _prompt_at_max_len(text: str, tokenizer: CLIPTokenizer) -> bool:
+    tokens = tokenizer(text, padding=True, return_tensors='pt')
+    num_tokens = tokens['input_ids'].shape[1]
+    return num_tokens > 69
 
 def _truncate_to_fit(text: str, tokenize) -> str:
     parts = text.split(', ')
