@@ -275,11 +275,12 @@ class Interrogator():
         flaves = flaves + self.negative.labels
         return self.chain(image_features, flaves, max_count=max_flavors, reverse=True, desc="Negative chain")
 
-    def interrogate_hf(self, image: Image, labels: 'LabelTable', min_flavors: int = 8, max_flavors: int = 32,
+    def interrogate_hf(self, image: Image, prompts: 'LabelTable', labels: 'LabelTable', min_flavors: int = 8, max_flavors: int = 32,
                         caption: Optional[str] = None) -> str:
 
         # caption = caption or self.generate_caption(image)
         image_features = self.image_to_features_hf(image)
+        caption = prompts.rank(image_features, 1)[0]
         flaves = labels.rank(image_features, self.config.flavor_intermediate_count)
         best_prompt, best_sim = caption, self.similarity(image_features, caption)
         best_prompt = self.chain(image_features, flaves, best_prompt, best_sim, min_count=min_flavors, max_count=max_flavors, desc="Flavor chain")
